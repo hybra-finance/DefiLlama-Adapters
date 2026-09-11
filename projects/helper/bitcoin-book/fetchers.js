@@ -6,6 +6,22 @@ const sdk = require('@defillama/sdk')
 
 const abi = { getQualifiedUserInfo: 'function getQualifiedUserInfo(address _user) view returns ((bool locked, string depositAddress, string withdrawalAddress) info)' }
 
+const bs58 = require('bs58').default || require('bs58')
+const crypto = require('crypto')
+const sha256 = b => crypto.createHash('sha256').update(b).digest()
+
+function isValidBitcoinAddress(addr) {
+  if (typeof addr !== 'string') return false
+  if (/^bc1[02-9ac-hj-np-z]{6,87}$/.test(addr)) return true
+  try {
+    const decoded = Buffer.from(bs58.decode(addr))
+    if (decoded.length !== 25) return false
+    return sha256(sha256(decoded.subarray(0, 21))).subarray(0, 4).equals(decoded.subarray(21))
+  } catch (e) {
+    return false
+  }
+}
+
 module.exports = {
   btcfi_cdp: async () => {
     const target = "0x0000000000000000000000000000000000000100";
@@ -19,7 +35,7 @@ module.exports = {
     return vault
   },
   bedrock: async () => {
-    const API_URL = 'https://raw.githubusercontent.com/Bedrock-Technology/uniBTC/refs/heads/main/data/tvl/reserve_address.json'
+    const API_URL = 'https://bedrock-datacenter.rockx.com/data/tvl/reserve_address.json'
     const { btc } = await getConfig('bedrock.btc_address', API_URL)
     return btc
   },
@@ -54,13 +70,38 @@ module.exports = {
     return Array.from(new Set(staticAddresses))
   },
 
+  wbtc: async () => {
+    const owners = await getConfig('wbtc/custody-addresses', undefined, {
+      fetcher: async () => {
+        const { data: { natives } } = await get('https://openapi.wbtc.network/public/v1/chains')
+        const addresses = new Set()
+        for (const { chainKey } of natives) {
+          try {
+            const { result } = await get(`https://wbtc.network/api/chain/${chainKey}/token/wbtc/addresses`)
+            result.filter(i => i.chain === 'btc' && i.type === 'custodial' && isValidBitcoinAddress(i.address))
+              .forEach(i => addresses.add(i.address))
+          } catch (e) {
+            sdk.log('wbtc: skipping chain', chainKey, e.message)
+          }
+        }
+        if (!addresses.size) throw new Error('wbtc: feed returned no custody addresses')
+        return [...addresses]
+      }
+    })
+    if (!owners.length) throw new Error('wbtc: no custody addresses available')
+    return owners
+  },
+
   b14g: async () => {
 
     return getConfig('b14g/bit-addresses', undefined, {
       fetcher: async () => {
-        const btcTxHashLockApi = 'https://api.b14g.xyz/restake/marketplace/defillama/btc-tx-hash'
-        const { data: { result } } = await get(btcTxHashLockApi)
-        const hashes = result.map(r => r.txHash)
+        const btcInCorechainTxHashLockApi = 'https://api.b14g.xyz/restake/marketplace/defillama/btc-tx-hash'
+        const { data: { result } } = await get(btcInCorechainTxHashLockApi)
+        const btcInBabylonGenesisTxHashLockApi = 'https://api.b14g.xyz/babylon-costaking/order/defillama/btc-tx-hash'
+        const resultInBabylonGenesis = await get(btcInBabylonGenesisTxHashLockApi)
+
+        const hashes = result.map(r => r.txHash).concat(resultInBabylonGenesis.map(r => r.txHash))
         const hashMap = await getCache('b14g/hash-map', 'core',) ?? {}
         for (const hash of hashes) {
           if (hashMap[hash]) continue;
@@ -224,7 +265,7 @@ module.exports = {
         return data.map(address => address)
       }
     })
-   
+
     return Array.from(new Set(staticAddresses))
   },
   zeusZBTC: async () => {
@@ -232,5 +273,148 @@ module.exports = {
     const data = await getConfig('zeus/zbtc', API_URL)
     const list = data.result.map(item => item.address)
     return list
+  },
+  binanceFetcher: async () => {
+    const staticAddresses = await getConfig('binance-cex/btc', undefined, {
+      fetcher: async () => {
+        const { data } = await axios.get('https://www.binance.com/bapi/apex/v1/public/apex/market/por/address')
+        return data.data.filter(i => i.network === 'BTC').map(item => item.address)
+      }
+    })
+    return Array.from(new Set(staticAddresses))
+  },
+  vishwa: async () => {
+    const staticAddresses = await getConfig('vishwa', undefined, {
+      fetcher: async () => {
+        const { data } = await axios.get('https://vault.vishwalab.com/vapi/btc/address')
+        return data.data
+      }
+    })
+    return Array.from(new Set(staticAddresses))
+  },
+  yala: async () => {
+    const staticAddresses = await getConfig('yala/bitcoin', undefined, {
+      fetcher: async () => {
+        const { data } = await axios.get('https://raw.githubusercontent.com/yalaorg/yala-defillama/refs/heads/main/config.json')
+        return data.bitcoin
+      }
+    })
+    return Array.from(new Set(staticAddresses))
+  },
+  symbiosis: async () => {
+    return getConfig('symbiosis/bitcoin-portal-addresses', undefined, {
+      fetcher: async () => {
+        const { addresses } = await get('https://api.symbiosis.finance/crosschain/v2/bitcoin-portal-addresses')
+        return addresses
+      }
+    })
+  },
+  teleswap: async () => {
+    const  { data: { lockers } } = await getConfig('teleswap/bitcoin', 'https://api.teleportdao.xyz/api/v1/teleswap/lockers/')
+    return lockers.filter(l => l.type === 'BTC').map(l => l.sourceAddress)
+  },
+  rskBridge: async (api) => {
+    return getConfig('rsk-bridge', undefined, {
+      fetcher: async () => {
+        api = new sdk.ChainApi({ chain: 'rsk', timestamp: api?.timestamp })
+        await api.getBlock()
+        const addr = await api.call({  abi: 'string:getFederationAddress', target:'0x0000000000000000000000000000000001000006' })
+        return [addr]
+      }
+    })
+  },
+  zenrock: async () => {
+    const ZRCHAIN_WALLETS_API = 'https://api.diamond.zenrocklabs.io/zrchain/treasury/zenbtc_wallets';
+    const ZENBTC_PARAMS_API = 'https://api.diamond.zenrocklabs.io/zenbtc/params';
+    const ZRCHAIN_KEY_BY_ID_API = 'https://api.diamond.zenrocklabs.io/zrchain/treasury/key_by_id';
+
+    // Always use latest addresses since wallets are only added, never removed.
+    // The balance checker will use the historical timestamp to get correct balances.
+    return getConfig('zenrock/addresses', undefined, {
+      fetcher: async () => {
+        async function getBitcoinAddresses() {
+          const btcAddresses = [];
+          let nextKey = null;
+
+          while (true) {
+            let url = ZRCHAIN_WALLETS_API;
+            if (nextKey) {
+              url += `?pagination.key=${encodeURIComponent(nextKey)}`;
+            }
+            const data = await get(url);
+            if (data.zenbtc_wallets && Array.isArray(data.zenbtc_wallets)) {
+              for (const walletGroup of data.zenbtc_wallets) {
+                if (walletGroup.wallets && Array.isArray(walletGroup.wallets)) {
+                  for (const wallet of walletGroup.wallets) {
+                    if (wallet.type === 'WALLET_TYPE_BTC_MAINNET' && wallet.address) {
+                      btcAddresses.push(wallet.address);
+                    }
+                  }
+                }
+              }
+            }
+            if (data.pagination && data.pagination.next_key) {
+              nextKey = data.pagination.next_key;
+            } else {
+              break;
+            }
+          }
+          return btcAddresses;
+        }
+
+        async function getChangeAddresses(paramsData) {
+          if (!paramsData?.params?.changeAddressKeyIDs) {
+            return [];
+          }
+          const changeAddresses = [];
+          for (const keyID of paramsData.params.changeAddressKeyIDs) {
+            const keyData = await get(`${ZRCHAIN_KEY_BY_ID_API}/${keyID}/WALLET_TYPE_BTC_MAINNET/`);
+            if (keyData.wallets && Array.isArray(keyData.wallets)) {
+              for (const wallet of keyData.wallets) {
+                if (wallet.type === 'WALLET_TYPE_BTC_MAINNET' && wallet.address) {
+                  changeAddresses.push(wallet.address);
+                }
+              }
+            }
+          }
+          return changeAddresses;
+        }
+
+        async function getRewardsDepositAddress(paramsData) {
+          const keyID = paramsData?.params?.rewardsDepositKeyID;
+          if (!keyID) return [];
+          const keyData = await get(`${ZRCHAIN_KEY_BY_ID_API}/${keyID}/WALLET_TYPE_BTC_MAINNET/`);
+          if (keyData.wallets && Array.isArray(keyData.wallets)) {
+            return keyData.wallets
+              .filter(w => w.type === 'WALLET_TYPE_BTC_MAINNET' && w.address)
+              .map(w => w.address);
+          }
+          return [];
+        }
+
+        const paramsData = await get(ZENBTC_PARAMS_API);
+        const [btcAddresses, changeAddresses, rewardsAddresses] = await Promise.all([
+          getBitcoinAddresses(),
+          getChangeAddresses(paramsData),
+          getRewardsDepositAddress(paramsData),
+        ]);
+        const allAddresses = [...btcAddresses, ...changeAddresses, ...rewardsAddresses];
+        return allAddresses;
+      }
+    });
+  },
+  coinbasebtc: async () => {
+    const { reserveAddresses = [] } = await getConfig(
+      'coinbase-cbbtc-proof-of-reserves',
+      'https://www.coinbase.com/cbbtc/proof-of-reserves.json'
+    )
+    return reserveAddresses.map(r => r.address).filter(Boolean)
+  },
+  coinbaseltc: async () => {
+    const { reserveAddresses = [] } = await getConfig(
+      'coinbase-cbltc-proof-of-reserves',
+      'https://www.coinbase.com/cbltc/proof-of-reserves.json'
+    )
+    return reserveAddresses.map(r => r.address).filter(Boolean)
   },
 }

@@ -1,39 +1,43 @@
-const {getConfig} = require("../helper/cache");
+const { getConfig } = require("../helper/cache");
+const { getTokenSupplies } = require("../helper/solana");
 
-async function tvl_ethereum_predeposit(api) {
-  const RESERVE_STAKING = "0xBa0Ae7069f94643853Fce3B8Af7f55AcBC11e397";
-  const SBTC = "0x094c0e36210634c3CfA25DC11B96b562E0b07624";
-  const STONE = "0x7122985656e38BDC0302Db86685bb972b145bD3C";
+const minTvl = 10_000;
+const includedStatuses = ["active", "hidden"];
 
-  await api.sumTokens({ owner: RESERVE_STAKING, tokens: [SBTC, STONE] });
+async function getIncludedVaults() {
+  const responses = await Promise.all(
+    includedStatuses.map(status =>
+      getConfig(
+        `nest-vaults-${status}`,
+        `https://api.nest.credit/v1/vaults/details?status=${status}`
+      )
+    )
+  );
+
+  return responses.flatMap(response => response?.data ?? [])
+    .filter(vault => vault.tvl > minTvl);
 }
 
-async function tvl_ethereum(api) {
-  await tvl_ethereum_predeposit(api);
-
-  const vaults = await getConfig('nest-vaults', "https://app.nest.credit/api/vaults?includeHidden=true");
-  const ethereumVaults = (vaults?.map(vault => vault.ethereum?.contractAddress) ?? []).filter(Boolean);
-  const details = await api.multiCall({ abi: 'erc20:totalSupply', calls: ethereumVaults })
-  api.add(ethereumVaults, details)
+function evmTvl(chain) {
+  return async function tvl(api) {
+    const vaults = await getIncludedVaults();
+    const addresses = vaults.filter(vault => vault.chain?.[chain]).map(vault => vault.vaultAddress);
+    const supplies = await api.multiCall({ abi: "erc20:totalSupply", calls: addresses });
+    api.add(addresses, supplies);
+  }
 }
 
-async function tvl_plume(api) {
-  const vaults = await getConfig('nest-vaults', "https://app.nest.credit/api/vaults?includeHidden=true");
-  const plumeVaults = (vaults?.map(vault => vault.plume?.contractAddress) ?? []).filter(Boolean);
-  const details = await api.multiCall({ abi: 'erc20:totalSupply', calls: plumeVaults })
-  api.add(plumeVaults, details)
-}
-
-async function tvl_plasma(api) {
-    const vaults = await getConfig('nest-vaults', "https://app.nest.credit/api/vaults?includeHidden=true");
-    const plasmaVaults = (vaults?.map(vault => vault.plasma?.contractAddress) ?? []).filter(Boolean);
-    const details = await api.multiCall({ abi: 'erc20:totalSupply', calls: plasmaVaults })
-    api.add(plasmaVaults, details)
+async function tvl_solana(api) {
+  const vaults = await getIncludedVaults();
+  const mints = vaults.filter(vault => vault.solana?.mintAddress).map(vault => vault.solana.mintAddress);
+  await getTokenSupplies(mints, { api });
 }
 
 module.exports = {
   methodology: "TVL is calculated from the value of Nest tokens, which represent user shares in vaults backed by yield-generating assets.",
-  ethereum: { tvl: tvl_ethereum },
-  plume_mainnet: { tvl: tvl_plume },
-  plasma: { tvl: tvl_plasma },
+  ethereum: { tvl: evmTvl("mainnet") },
+  plume_mainnet: { tvl: evmTvl("plume") },
+  bsc: { tvl: evmTvl("bsc") },
+  avax: { tvl: evmTvl("avalanche") },
+  solana: { tvl: tvl_solana },
 }
